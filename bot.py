@@ -5,7 +5,7 @@ from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, MessageHandler, CallbackQueryHandler,
+    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
 )
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -14,7 +14,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 ADMIN_ID  = int(os.environ.get("ADMIN_ID", "0"))
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MONGO_URI = os.environ.get("MONGO_URI", "")
-PORT      = int(os.environ.get("PORT", 8080))
+PORT      = int(os.environ.get("PORT", 10000))
 
 # ─── MongoDB ──────────────────────────────────────────────────────
 mongo_client = AsyncIOMotorClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
@@ -69,10 +69,8 @@ def kb_confirm(btn_count: int):
         [InlineKeyboardButton("✅ Confirm & Send", callback_data="bc_confirm")],
         [InlineKeyboardButton("❌ Cancel",         callback_data="bc_cancel")]
     ]
- 
     if btn_count < 10:
         rows.append([InlineKeyboardButton("➕ Add More Buttons", callback_data="bc_addbtns")])
-        
     return InlineKeyboardMarkup(rows)
 
 def kb_cancel_only():
@@ -127,7 +125,6 @@ async def show_confirm_preview(chat_id, context, state):
     )
 
     if len(msg_ids) > 1:
-        # Media group — copy all, attach buttons only to last
         for i, mid in enumerate(msg_ids):
             await context.bot.copy_message(
                 chat_id=chat_id,
@@ -192,7 +189,8 @@ async def _do_broadcast(context, admin_chat_id):
                     reply_markup=rm
                 )
             ok += 1
-        except Exception:
+        except Exception as e:
+            print(f"❌ Broadcast fail for {uid}: {e}")
             fail += 1
         await asyncio.sleep(0.08)
 
@@ -210,7 +208,7 @@ async def _do_broadcast(context, admin_chat_id):
 
 # ─── Handle user media group (forward album to admin) ─────────────
 async def flush_user_media_group(group_id: str, context: ContextTypes.DEFAULT_TYPE):
-    """Called after 1s delay — forwards all collected group messages to admin."""
+    """Called after 1s delay — copies all collected group messages to admin."""
     await asyncio.sleep(1.0)
     buf = media_group_buffer.get(group_id)
     if not buf or not buf["msgs"]:
@@ -227,17 +225,20 @@ async def flush_user_media_group(group_id: str, context: ContextTypes.DEFAULT_TY
             text=f"👤 *{user.first_name}*{uname}\n`ID: {user.id}`\n📎 _{len(msgs)} media items_",
             parse_mode="Markdown"
         )
-        # Forward all as a group
-        fwd_msgs = await context.bot.forward_messages(
-            chat_id=ADMIN_ID,
-            from_chat_id=msgs[0].chat_id,
-            message_ids=[m.message_id for m in msgs]
-        )
-        # Map ALL forwarded message IDs to user
+        # ✅ copy_message instead of forward — bypasses privacy settings
+        fwd_msgs = []
+        for m in msgs:
+            fwd = await context.bot.copy_message(
+                chat_id=ADMIN_ID,
+                from_chat_id=m.chat_id,
+                message_id=m.message_id
+            )
+            fwd_msgs.append(fwd)
+
+        # Map ALL copied message IDs to user
         for fwd in fwd_msgs:
             user_map[fwd.message_id] = user_id
 
-        # Send status to user
         status = await msgs[0].reply_text("✅ Message sent!")
         await asyncio.sleep(1.5)
         try:
@@ -245,6 +246,7 @@ async def flush_user_media_group(group_id: str, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
     except Exception as e:
+        print(f"❌ Error forwarding media group from {user_id}: {e}")
         try:
             await msgs[0].reply_text("❌ Failed to send. Try again!")
         except Exception:
@@ -292,6 +294,17 @@ async def flush_bc_media_group(group_id: str, msg, context: ContextTypes.DEFAULT
     del bc_group_buffer[group_id]
 
 
+# ─── START HANDLER ────────────────────────────────────────────────
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    await save_user(user.id, user.first_name)
+    await update.message.reply_text(
+        f"👋 Hello *{user.first_name}*!\n\n"
+        "This is official Danger ",
+        parse_mode="Markdown"
+    )
+
+
 # ─── MAIN HANDLER ─────────────────────────────────────────────────
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -300,7 +313,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid       = msg.from_user.id
     text      = (msg.text or "").strip()
-    group_id  = msg.media_group_id  # None if not part of an album
+    group_id  = msg.media_group_id
 
     # ══════════════ ADMIN ═════════════════════════════════════════
     if uid == ADMIN_ID:
@@ -309,7 +322,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ── Step: waiting for broadcast message ──
         if state["step"] == BC_WAIT:
             if group_id:
-                # Album/media group — collect all parts
                 buf = bc_group_buffer[group_id]
                 buf["msgs"].append(msg)
                 if buf["task"] is None or buf["task"].done():
@@ -318,7 +330,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 return
             else:
-                # Single message broadcast
                 state["chat_id"] = msg.chat_id
                 state["msg_ids"] = [msg.message_id]
                 state["step"]    = BC_CONFIRM
@@ -339,7 +350,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        # ── Step: collecting buttons (all at once) ──
+        # ── Step: collecting buttons ──
         if state["step"] == BC_BUTTONS:
             lines  = [l.strip() for l in text.splitlines() if l.strip()]
             errors = []
@@ -431,7 +442,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_user(user.id, user.first_name)
 
     if group_id:
-        # Media group — buffer and forward together
         buf = media_group_buffer[group_id]
         buf["msgs"].append(msg)
         buf["user_id"] = user.id
@@ -449,10 +459,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"👤 *{user.first_name}*{uname}\n`ID: {user.id}`",
             parse_mode="Markdown"
         )
-        fwd = await msg.forward(chat_id=ADMIN_ID)
+        # ✅ copy_message — bypasses Telegram forward privacy settings
+        fwd = await context.bot.copy_message(
+            chat_id=ADMIN_ID,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id
+        )
         user_map[fwd.message_id] = user.id
         status = await msg.reply_text("✅ Message sent!")
-    except Exception:
+    except Exception as e:
+        print(f"❌ Error forwarding message from {user.id}: {e}")
         status = await msg.reply_text("❌ Failed to send. Try again!")
 
     await asyncio.sleep(3)
@@ -508,6 +524,7 @@ threading.Thread(target=_web, daemon=True).start()
 print(f"✅ Keep-alive on port {PORT}")
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", on_start))       # ✅ /start handler added
 app.add_handler(CallbackQueryHandler(on_callback))
 app.add_handler(MessageHandler(filters.ALL, on_message))
 
