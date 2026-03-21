@@ -1,5 +1,6 @@
 import asyncio
 import os
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
@@ -8,7 +9,7 @@ from telegram.ext import (
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # ─── Config ───────────────────────────────────────────────────────
-ADMIN_ID = os.environ.get("ADMIN_ID")
+ADMIN_ID = os.environ("ADMIN_ID")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
 
@@ -83,7 +84,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         status = await update.message.reply_text("❌ Failed to send. Try again!")
 
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
     try:
         await status.delete()
     except Exception:
@@ -306,5 +307,30 @@ app.add_handler(broadcast_conv)
 app.add_handler(CommandHandler("stats", stats))
 app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
-print("🤖 Bot is running...")
-app.run_polling()
+# ─── Web Server (Required for Render Free Web Service) ────────────
+async def health(request):
+    return web.Response(text="✅ Bot is running!")
+
+async def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = web.Application()
+    server.router.add_get("/", health)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Web server running on port {port}")
+
+# ─── Main Runner ──────────────────────────────────────────────────
+async def main():
+    await run_web_server()
+    print("🤖 Bot is running...")
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        # Keep running forever
+        await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
