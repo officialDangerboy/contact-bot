@@ -1,6 +1,7 @@
 import asyncio
 import os
 import threading
+from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,12 +22,19 @@ db        = mongo_client["telebot"]
 users_col = db["users"]
 
 # ─── State ────────────────────────────────────────────────────────
-user_map = {}  # forwarded_msg_id -> user_id
+user_map   = {}   # forwarded_msg_id -> user_id
+
+# Media group buffers
+# group_id -> {"msgs": [...], "user_id": int, "task": asyncio.Task}
+media_group_buffer = defaultdict(lambda: {"msgs": [], "user_id": None, "task": None})
 
 BC_IDLE    = 0
 BC_WAIT    = 1
 BC_BUTTONS = 2
 BC_CONFIRM = 3
+
+# Broadcast media group buffer (for admin)
+bc_group_buffer = defaultdict(lambda: {"msgs": [], "task": None})
 
 
 # ─── Keep-Alive ───────────────────────────────────────────────────
@@ -84,7 +92,7 @@ CMD_MENU = (
     "Reply to any forwarded message\n\n"
     "📢 *Broadcast guide:*\n"
     "1⃣ Send `.broadcast`\n"
-    "2⃣ Send your message (any type)\n"
+    "2⃣ Send your message (any type, even albums)\n"
     "3⃣ See preview → pick option\n"
     "4⃣ To add buttons, send all at once:\n"
     "`Btn Name - https://link.com`\n"
@@ -96,29 +104,43 @@ CMD_MENU = (
 
 # ─── Broadcast state helpers ──────────────────────────────────────
 def bc(ctx):
-    return ctx.user_data.setdefault("bc", {"step": BC_IDLE, "buttons": []})
+    return ctx.user_data.setdefault("bc", {"step": BC_IDLE, "buttons": [], "msg_ids": []})
 
 def bc_reset(ctx):
-    ctx.user_data["bc"] = {"step": BC_IDLE, "buttons": []}
+    ctx.user_data["bc"] = {"step": BC_IDLE, "buttons": [], "msg_ids": []}
 
 
-# ─── Show confirm preview with buttons ────────────────────────────
-async def show_confirm_preview(target_chat_id, context, state):
+# ─── Show confirm preview ─────────────────────────────────────────
+async def show_confirm_preview(chat_id, context, state):
     buttons  = state.get("buttons", [])
     keyboard = [[InlineKeyboardButton(b["name"], url=b["url"])] for b in buttons]
+    rm       = InlineKeyboardMarkup(keyboard) if keyboard else None
     total    = await users_col.count_documents({})
+    msg_ids  = state.get("msg_ids", [state.get("msg_id")])
+    src_chat = state["chat_id"]
 
     await context.bot.send_message(
-        chat_id=target_chat_id,
+        chat_id=chat_id,
         text="👁 *Final Preview with Buttons:*",
         parse_mode="Markdown"
     )
-    await context.bot.copy_message(
-        chat_id=target_chat_id,
-        from_chat_id=state["chat_id"],
-        message_id=state["msg_id"],
-        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-    )
+
+    if len(msg_ids) > 1:
+        # Media group — copy all, attach buttons only to last
+        for i, mid in enumerate(msg_ids):
+            await context.bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=src_chat,
+                message_id=mid,
+                reply_markup=rm if i == len(msg_ids) - 1 else None
+            )
+    else:
+        await context.bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=src_chat,
+            message_id=msg_ids[0],
+            reply_markup=rm
+        )
 
     btn_list = "\n".join(
         f"  {i+1}. {b['name']} → {b['url']}" for i, b in enumerate(buttons)
@@ -126,10 +148,11 @@ async def show_confirm_preview(target_chat_id, context, state):
 
     state["step"] = BC_CONFIRM
     await context.bot.send_message(
-        chat_id=target_chat_id,
+        chat_id=chat_id,
         text=(
             f"📊 *Broadcast Summary*\n\n"
             f"👥 Will send to *{total} users*\n"
+            f"📎 Messages: *{len(msg_ids)}*\n"
             f"🔘 Buttons ({len(buttons)}):\n{btn_list}\n\n"
             f"Confirm to send?"
         ),
@@ -144,22 +167,33 @@ async def _do_broadcast(context, admin_chat_id):
     buttons  = state.get("buttons", [])
     keyboard = [[InlineKeyboardButton(b["name"], url=b["url"])] for b in buttons]
     rm       = InlineKeyboardMarkup(keyboard) if keyboard else None
+    msg_ids  = state.get("msg_ids", [state.get("msg_id")])
+    src_chat = state["chat_id"]
 
     uids = await all_user_ids()
     ok = fail = 0
 
     for uid in uids:
         try:
-            await context.bot.copy_message(
-                chat_id=uid,
-                from_chat_id=state["chat_id"],
-                message_id=state["msg_id"],
-                reply_markup=rm
-            )
+            if len(msg_ids) > 1:
+                for i, mid in enumerate(msg_ids):
+                    await context.bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=src_chat,
+                        message_id=mid,
+                        reply_markup=rm if i == len(msg_ids) - 1 else None
+                    )
+            else:
+                await context.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=src_chat,
+                    message_id=msg_ids[0],
+                    reply_markup=rm
+                )
             ok += 1
         except Exception:
             fail += 1
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.08)
 
     await context.bot.send_message(
         chat_id=admin_chat_id,
@@ -173,14 +207,99 @@ async def _do_broadcast(context, admin_chat_id):
     )
 
 
+# ─── Handle user media group (forward album to admin) ─────────────
+async def flush_user_media_group(group_id: str, context: ContextTypes.DEFAULT_TYPE):
+    """Called after 1s delay — forwards all collected group messages to admin."""
+    await asyncio.sleep(1.0)
+    buf = media_group_buffer.get(group_id)
+    if not buf or not buf["msgs"]:
+        return
+
+    msgs    = sorted(buf["msgs"], key=lambda m: m.message_id)
+    user_id = buf["user_id"]
+    user    = msgs[0].from_user
+
+    try:
+        uname = f" (@{user.username})" if user.username else ""
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"👤 *{user.first_name}*{uname}\n`ID: {user.id}`\n📎 _{len(msgs)} media items_",
+            parse_mode="Markdown"
+        )
+        # Forward all as a group
+        fwd_msgs = await context.bot.forward_messages(
+            chat_id=ADMIN_ID,
+            from_chat_id=msgs[0].chat_id,
+            message_ids=[m.message_id for m in msgs]
+        )
+        # Map ALL forwarded message IDs to user
+        for fwd in fwd_msgs:
+            user_map[fwd.message_id] = user_id
+
+        # Send status to user
+        status = await msgs[0].reply_text("✅ Message sent!")
+        await asyncio.sleep(1.5)
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            await msgs[0].reply_text("❌ Failed to send. Try again!")
+        except Exception:
+            pass
+
+    del media_group_buffer[group_id]
+
+
+# ─── Handle broadcast media group (collect admin album) ───────────
+async def flush_bc_media_group(group_id: str, msg, context: ContextTypes.DEFAULT_TYPE, state: dict):
+    """Called after 1s — processes collected broadcast album."""
+    await asyncio.sleep(1.0)
+    buf = bc_group_buffer.get(group_id)
+    if not buf or not buf["msgs"]:
+        return
+
+    msgs_sorted = sorted(buf["msgs"], key=lambda m: m.message_id)
+    state["chat_id"] = msgs_sorted[0].chat_id
+    state["msg_ids"] = [m.message_id for m in msgs_sorted]
+    state["step"]    = BC_CONFIRM
+    total = await users_col.count_documents({})
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text="👁 *Preview:*",
+        parse_mode="Markdown"
+    )
+    for m in msgs_sorted:
+        await context.bot.copy_message(
+            chat_id=ADMIN_ID,
+            from_chat_id=m.chat_id,
+            message_id=m.message_id
+        )
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"📢 *Broadcast Preview*\n\n"
+            f"📎 Album: *{len(msgs_sorted)} items*\n"
+            f"👥 Will send to *{total} users*\n\n"
+            f"Choose an option:"
+        ),
+        parse_mode="Markdown",
+        reply_markup=kb_after_preview()
+    )
+    del bc_group_buffer[group_id]
+
+
 # ─── MAIN HANDLER ─────────────────────────────────────────────────
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
 
-    uid  = msg.from_user.id
-    text = (msg.text or "").strip()
+    uid       = msg.from_user.id
+    text      = (msg.text or "").strip()
+    group_id  = msg.media_group_id  # None if not part of an album
 
     # ══════════════ ADMIN ═════════════════════════════════════════
     if uid == ADMIN_ID:
@@ -188,25 +307,36 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Step: waiting for broadcast message ──
         if state["step"] == BC_WAIT:
-            state["chat_id"] = msg.chat_id
-            state["msg_id"]  = msg.message_id
-            state["step"]    = BC_CONFIRM
-            total = await users_col.count_documents({})
+            if group_id:
+                # Album/media group — collect all parts
+                buf = bc_group_buffer[group_id]
+                buf["msgs"].append(msg)
+                if buf["task"] is None or buf["task"].done():
+                    buf["task"] = asyncio.create_task(
+                        flush_bc_media_group(group_id, msg, context, state)
+                    )
+                return
+            else:
+                # Single message broadcast
+                state["chat_id"] = msg.chat_id
+                state["msg_ids"] = [msg.message_id]
+                state["step"]    = BC_CONFIRM
+                total = await users_col.count_documents({})
 
-            await msg.reply_text("👁 *Preview:*", parse_mode="Markdown")
-            await context.bot.copy_message(
-                chat_id=ADMIN_ID,
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id
-            )
-            await msg.reply_text(
-                f"📢 *Broadcast Preview*\n\n"
-                f"👥 Will send to *{total} users*\n\n"
-                f"Choose an option:",
-                parse_mode="Markdown",
-                reply_markup=kb_after_preview()
-            )
-            return
+                await msg.reply_text("👁 *Preview:*", parse_mode="Markdown")
+                await context.bot.copy_message(
+                    chat_id=ADMIN_ID,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id
+                )
+                await msg.reply_text(
+                    f"📢 *Broadcast Preview*\n\n"
+                    f"👥 Will send to *{total} users*\n\n"
+                    f"Choose an option:",
+                    parse_mode="Markdown",
+                    reply_markup=kb_after_preview()
+                )
+                return
 
         # ── Step: collecting buttons (all at once) ──
         if state["step"] == BC_BUTTONS:
@@ -216,7 +346,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             for line in lines:
                 if len(state["buttons"]) >= 10:
-                    errors.append("⚠️ Max 10 buttons reached, rest skipped.")
+                    errors.append("⚠️ Max 10 buttons reached.")
                     break
                 if " - " not in line:
                     errors.append(f"❌ Bad format: `{line}`")
@@ -230,13 +360,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 added.append(name)
 
             if errors and not added:
-                # All lines failed
                 reply = "\n".join(errors)
-                reply += "\n\nFormat:\n`Button Name - https://link.com`\n_(one per line, up to 10)_"
+                reply += "\n\nFormat:\n`Button Name - https://link.com`\n_(one per line)_"
                 await msg.reply_text(reply, parse_mode="Markdown", reply_markup=kb_cancel_only())
                 return
 
-            # Show preview with buttons right away
             await show_confirm_preview(msg.chat_id, context, state)
             return
 
@@ -256,7 +384,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == ".users":
             lines = []
             async for doc in users_col.find({}):
-                lines.append(f"• {doc.get('name', 'Unknown')} — `{doc['_id']}`")
+                lines.append(f"• {doc.get('name','Unknown')} — `{doc['_id']}`")
             if not lines:
                 await msg.reply_text("No users yet.")
                 return
@@ -273,7 +401,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(
                 "📢 *Broadcast Setup*\n\n"
                 "Send the message you want to broadcast.\n\n"
-                "_Supports: text, photo, video, voice, sticker, document_",
+                "_Supports: text, photo, video, voice, sticker, document, albums_",
                 parse_mode="Markdown",
                 reply_markup=kb_cancel_only()
             )
@@ -301,6 +429,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = msg.from_user
     await save_user(user.id, user.first_name)
 
+    if group_id:
+        # Media group — buffer and forward together
+        buf = media_group_buffer[group_id]
+        buf["msgs"].append(msg)
+        buf["user_id"] = user.id
+        if buf["task"] is None or buf["task"].done():
+            buf["task"] = asyncio.create_task(
+                flush_user_media_group(group_id, context)
+            )
+        return
+
+    # Single message
     try:
         uname = f" (@{user.username})" if user.username else ""
         await context.bot.send_message(
@@ -346,10 +486,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✏️ *Add URL Buttons*\n\n"
             "Send all buttons in *one message*, one per line:\n\n"
             "`Button Name - https://example.com`\n"
-            "`Button 2 - https://example2.com`\n"
-            "`Button 3 - https://example3.com`\n\n"
+            "`Button 2 - https://example2.com`\n\n"
             "_Up to 10 buttons at once._\n\n"
-            "After sending, preview with buttons will show automatically ✅",
+            "After sending, preview with buttons shows automatically ✅",
             parse_mode="Markdown",
             reply_markup=kb_cancel_only()
         )
