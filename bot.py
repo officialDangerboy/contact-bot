@@ -257,7 +257,7 @@ async def flush_user(uid, context):
         for fwd in fwd_list:
             user_map[fwd.message_id] = uid
 
-        status = await first.reply_text("*✅ Message Sent!*")
+        status = await first.reply_text("✅ Sent!")
         await asyncio.sleep(3)
         try:
             await status.delete()
@@ -266,7 +266,7 @@ async def flush_user(uid, context):
 
     except Exception as e:
         try:
-            await first.reply_text("*❌ Failed. Try again!*")
+            await first.reply_text("❌ Failed. Try again!")
         except Exception:
             pass
 
