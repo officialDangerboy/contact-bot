@@ -22,10 +22,7 @@ db        = mongo_client["telebot"]
 users_col = db["users"]
 
 # ─── State ────────────────────────────────────────────────────────
-user_map   = {}   # forwarded_msg_id -> user_id
-
-# Media group buffers
-# group_id -> {"msgs": [...], "user_id": int, "task": asyncio.Task}
+user_map           = {}   # copied_msg_id -> user_id
 media_group_buffer = defaultdict(lambda: {"msgs": [], "user_id": None, "task": None})
 
 BC_IDLE    = 0
@@ -33,7 +30,6 @@ BC_WAIT    = 1
 BC_BUTTONS = 2
 BC_CONFIRM = 3
 
-# Broadcast media group buffer (for admin)
 bc_group_buffer = defaultdict(lambda: {"msgs": [], "task": None})
 
 
@@ -46,6 +42,17 @@ class _H(BaseHTTPRequestHandler):
 
 def _web():
     HTTPServer(("0.0.0.0", PORT), _H).serve_forever()
+
+
+# ─── Markdown Escape ──────────────────────────────────────────────
+def escape_md(text: str) -> str:
+    """Escape special Markdown v1 characters in user-provided strings.
+    Fixes crash when user names contain _ * ` [ characters."""
+    if not text:
+        return ""
+    for ch in ['_', '*', '`', '[']:
+        text = text.replace(ch, f'\\{ch}')
+    return text
 
 
 # ─── DB Helpers ───────────────────────────────────────────────────
@@ -206,7 +213,7 @@ async def _do_broadcast(context, admin_chat_id):
     )
 
 
-# ─── Handle user media group (forward album to admin) ─────────────
+# ─── Handle user media group (copy album to admin) ────────────────
 async def flush_user_media_group(group_id: str, context: ContextTypes.DEFAULT_TYPE):
     """Called after 1s delay — copies all collected group messages to admin."""
     await asyncio.sleep(1.0)
@@ -219,13 +226,20 @@ async def flush_user_media_group(group_id: str, context: ContextTypes.DEFAULT_TY
     user    = msgs[0].from_user
 
     try:
-        uname = f" (@{user.username})" if user.username else ""
+        # ✅ Escaped — safe for ALL user names/usernames
+        safe_name  = escape_md(user.first_name)
+        safe_uname = f" (@{escape_md(user.username)})" if user.username else ""
+
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"👤 *{user.first_name}*{uname}\n`ID: {user.id}`\n📎 _{len(msgs)} media items_",
+            text=(
+                f"👤 *{safe_name}*{safe_uname}\n"
+                f"`ID: {user.id}`\n"
+                f"📎 _{len(msgs)} media items_"
+            ),
             parse_mode="Markdown"
         )
-        # ✅ copy_message instead of forward — bypasses privacy settings
+
         fwd_msgs = []
         for m in msgs:
             fwd = await context.bot.copy_message(
@@ -235,7 +249,6 @@ async def flush_user_media_group(group_id: str, context: ContextTypes.DEFAULT_TY
             )
             fwd_msgs.append(fwd)
 
-        # Map ALL copied message IDs to user
         for fwd in fwd_msgs:
             user_map[fwd.message_id] = user_id
 
@@ -245,6 +258,7 @@ async def flush_user_media_group(group_id: str, context: ContextTypes.DEFAULT_TY
             await status.delete()
         except Exception:
             pass
+
     except Exception as e:
         print(f"❌ Error forwarding media group from {user_id}: {e}")
         try:
@@ -298,9 +312,11 @@ async def flush_bc_media_group(group_id: str, msg, context: ContextTypes.DEFAULT
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     await save_user(user.id, user.first_name)
+    # ✅ Escaped — safe for all names
+    safe_name = escape_md(user.first_name)
     await update.message.reply_text(
-        f"👋 Hello *{user.first_name}*!\n\n"
-        "This is official Danger ",
+        f"👋 Hello *{safe_name}*!\n\n"
+        "Send me a message and I'll forward it.",
         parse_mode="Markdown"
     )
 
@@ -311,9 +327,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    uid       = msg.from_user.id
-    text      = (msg.text or "").strip()
-    group_id  = msg.media_group_id
+    uid      = msg.from_user.id
+    text     = (msg.text or "").strip()
+    group_id = msg.media_group_id
 
     # ══════════════ ADMIN ═════════════════════════════════════════
     if uid == ADMIN_ID:
@@ -396,7 +412,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == ".users":
             lines = []
             async for doc in users_col.find({}):
-                lines.append(f"• {doc.get('name','Unknown')} — `{doc['_id']}`")
+                # ✅ Escape stored names — they may contain special chars
+                safe = escape_md(doc.get('name', 'Unknown'))
+                lines.append(f"• {safe} — `{doc['_id']}`")
             if not lines:
                 await msg.reply_text("No users yet.")
                 return
@@ -453,10 +471,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Single message
     try:
-        uname = f" (@{user.username})" if user.username else ""
+        # ✅ Escaped — safe for ALL user names/usernames
+        safe_name  = escape_md(user.first_name)
+        safe_uname = f" (@{escape_md(user.username)})" if user.username else ""
+
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"👤 *{user.first_name}*{uname}\n`ID: {user.id}`",
+            text=(
+                f"👤 *{safe_name}*{safe_uname}\n"
+                f"`ID: {user.id}`"
+            ),
             parse_mode="Markdown"
         )
         # ✅ copy_message — bypasses Telegram forward privacy settings
@@ -467,6 +491,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         user_map[fwd.message_id] = user.id
         status = await msg.reply_text("✅ Message sent!")
+
     except Exception as e:
         print(f"❌ Error forwarding message from {user.id}: {e}")
         status = await msg.reply_text("❌ Failed to send. Try again!")
@@ -524,7 +549,7 @@ threading.Thread(target=_web, daemon=True).start()
 print(f"✅ Keep-alive on port {PORT}")
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", on_start))       # ✅ /start handler added
+app.add_handler(CommandHandler("start", on_start))
 app.add_handler(CallbackQueryHandler(on_callback))
 app.add_handler(MessageHandler(filters.ALL, on_message))
 
