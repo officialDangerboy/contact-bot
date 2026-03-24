@@ -17,9 +17,10 @@ MONGO_URI = os.environ.get("MONGO_URI", "")
 PORT      = int(os.environ.get("PORT", 10000))
 
 # ─── MongoDB ──────────────────────────────────────────────────────
-mongo_client = AsyncIOMotorClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
-db        = mongo_client["telebot"]
-users_col = db["users"]
+# Initialized inside async main() to avoid event loop issues
+mongo_client = None
+db        = None
+users_col = None
 
 # ─── State ────────────────────────────────────────────────────────
 user_map           = {}   # copied_msg_id -> user_id
@@ -545,13 +546,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── Run ──────────────────────────────────────────────────────────
-threading.Thread(target=_web, daemon=True).start()
-print(f"✅ Keep-alive on port {PORT}")
+async def main():
+    global mongo_client, db, users_col
+    mongo_client = AsyncIOMotorClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
+    db        = mongo_client["telebot"]
+    users_col = db["users"]
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", on_start))
-app.add_handler(CallbackQueryHandler(on_callback))
-app.add_handler(MessageHandler(filters.ALL, on_message))
+    threading.Thread(target=_web, daemon=True).start()
+    print(f"✅ Keep-alive on port {PORT}")
 
-print("🤖 Bot running...")
-app.run_polling()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.ALL, on_message))
+
+    print("🤖 Bot running...")
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
