@@ -65,8 +65,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 def run_health_server():
     HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
-threading.Thread(target=run_health_server, daemon=True).start()
-print(f"✅ Keep-alive on port {PORT}")
+
 
 # ─── Markdown Escape ──────────────────────────────────────────────
 def escape_md(text: str) -> str:
@@ -569,7 +568,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── Run ──────────────────────────────────────────────────────────
-threading.Thread(target=_web, daemon=True).start()
+threading.Thread(target=run_health_server, daemon=True).start()
 print(f"✅ Keep-alive on port {PORT}")
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
