@@ -34,26 +34,39 @@ bc_group_buffer = defaultdict(lambda: {"msgs": [], "task": None})
 
 
 # ─── Keep-Alive ───────────────────────────────────────────────────
-class _H(BaseHTTPRequestHandler):
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+        if self.path in ['/', '/health']:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', '14')
+            self.end_headers()
+            self.wfile.write(b"Bot is alive!\n")
+        else:
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Not Found")
     
     def do_HEAD(self):
-        """Handle HEAD requests from UptimeRobot"""
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        # No body for HEAD requests
+        if self.path in ['/', '/health']:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', '14')
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
     
-    def log_message(self, *a): 
-        pass  # Suppress logs
+    def log_message(self, format, *args):
+        pass
 
-def _web():
-    HTTPServer(("0.0.0.0", PORT), _H).serve_forever()
+def run_health_server():
+    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
+threading.Thread(target=run_health_server, daemon=True).start()
+print(f"✅ Keep-alive on port {PORT}")
 
 # ─── Markdown Escape ──────────────────────────────────────────────
 def escape_md(text: str) -> str:
